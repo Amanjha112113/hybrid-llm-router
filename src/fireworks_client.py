@@ -17,11 +17,17 @@ from typing import Optional
 
 import httpx
 
+from src.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig
+
 logger = logging.getLogger(__name__)
 
 
 class FireworksClientError(Exception):
     """Raised when a Fireworks call fails after all retries are exhausted."""
+
+
+class CircuitBreakerOpenError(FireworksClientError):
+    """Raised when the circuit breaker is open and rejects a request."""
 
 
 @dataclass
@@ -39,6 +45,7 @@ class FireworksClient:
         base_url: str,
         timeout_seconds: float = 120.0,
         max_retries: int = 2,
+        enable_circuit_breaker: bool = True,
     ):
         if not api_key:
             raise ValueError("FIREWORKS_API_KEY is required")
@@ -57,9 +64,42 @@ class FireworksClient:
             },
             timeout=timeout_seconds,
         )
+        
+        # Circuit breaker for resilience
+        self._enable_circuit_breaker = enable_circuit_breaker
+        if enable_circuit_breaker:
+            # Configure circuit breaker for API calls
+            config = CircuitBreakerConfig(
+                failure_threshold=5,      # Open after 5 failures
+                success_threshold=2,      # Close after 2 successes
+                timeout_seconds=30.0,     # Try half-open after 30s
+                window_seconds=60.0,      # 60s rolling window
+            )
+            self._circuit_breaker = get_circuit_breaker("fireworks-api", config)
+        else:
+            self._circuit_breaker = None
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    def _check_circuit_breaker(self):
+        """Check if circuit breaker allows requests. Raises if open."""
+        if self._enable_circuit_breaker and self._circuit_breaker:
+            if not self._circuit_breaker.allow_request():
+                raise CircuitBreakerOpenError(
+                    "Fireworks API circuit breaker is OPEN - service temporarily unavailable. "
+                    "The circuit breaker will automatically retry after a cooldown period."
+                )
+
+    def _record_success(self):
+        """Record successful API call for circuit breaker."""
+        if self._enable_circuit_breaker and self._circuit_breaker:
+            self._circuit_breaker.record_success()
+
+    def _record_failure(self):
+        """Record failed API call for circuit breaker."""
+        if self._enable_circuit_breaker and self._circuit_breaker:
+            self._circuit_breaker.record_failure()
 
     async def complete(
         self,
@@ -77,6 +117,9 @@ class FireworksClient:
         if provided and already passed, the call is skipped immediately
         rather than issued, to protect the global runtime budget.
         """
+        # Check circuit breaker before making request
+        self._check_circuit_breaker()
+        
         if deadline is not None and _time_remaining(deadline) <= 0:
             raise FireworksClientError("Deadline already exceeded — call skipped")
 
@@ -108,7 +151,11 @@ class FireworksClient:
                 response = await self._client.post("/chat/completions", json=payload, timeout=call_timeout)
                 response.raise_for_status()
                 data = response.json()
-                return _parse_completion(data, model)
+                result = _parse_completion(data, model)
+                
+                # Record success for circuit breaker
+                self._record_success()
+                return result
 
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
@@ -127,11 +174,13 @@ class FireworksClient:
                     )
                 else:
                     # Client-side error (e.g. bad model id, bad request) — do not retry.
+                    # Don't count as circuit breaker failure (it's a client error)
                     raise FireworksClientError(
                         f"Non-retryable error calling {model}: {status} {exc.response.text}"
                     ) from exc
             except (KeyError, ValueError, IndexError) as exc:
                 # Malformed response body — do not spin retries forever.
+                # Don't count as circuit breaker failure (it's a parsing error)
                 raise FireworksClientError(f"Malformed response from {model}: {exc}") from exc
 
             # Exponential backoff before retrying, but never past the deadline.
@@ -141,6 +190,8 @@ class FireworksClient:
                     backoff = min(backoff, max(_time_remaining(deadline), 0))
                 await asyncio.sleep(backoff)
 
+        # All retries exhausted - record failure for circuit breaker
+        self._record_failure()
         raise FireworksClientError(f"Exhausted retries calling {model}: {last_error}")
 
     async def complete_chat(
@@ -154,6 +205,9 @@ class FireworksClient:
         """
         Execute multi-turn chat completion with a list of message dicts.
         """
+        # Check circuit breaker before making request
+        self._check_circuit_breaker()
+        
         if deadline is not None and _time_remaining(deadline) <= 0:
             raise FireworksClientError("Deadline already exceeded — call skipped")
 
@@ -182,7 +236,11 @@ class FireworksClient:
                 response = await self._client.post("/chat/completions", json=payload, timeout=call_timeout)
                 response.raise_for_status()
                 data = response.json()
-                return _parse_completion(data, model)
+                result = _parse_completion(data, model)
+                
+                # Record success for circuit breaker
+                self._record_success()
+                return result
 
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
@@ -199,10 +257,12 @@ class FireworksClient:
                         status, model, attempt + 1, self._max_retries + 1,
                     )
                 else:
+                    # Client-side error - don't count as circuit breaker failure
                     raise FireworksClientError(
                         f"Non-retryable error calling {model}: {status} {exc.response.text}"
                     ) from exc
             except (KeyError, ValueError, IndexError) as exc:
+                # Parsing error - don't count as circuit breaker failure
                 raise FireworksClientError(f"Malformed response from {model}: {exc}") from exc
 
             if attempt < self._max_retries:
@@ -211,6 +271,8 @@ class FireworksClient:
                     backoff = min(backoff, max(_time_remaining(deadline), 0))
                 await asyncio.sleep(backoff)
 
+        # All retries exhausted - record failure for circuit breaker
+        self._record_failure()
         raise FireworksClientError(f"Exhausted retries calling {model}: {last_error}")
 
 

@@ -1076,11 +1076,13 @@ async def get_conversation_statistics() -> dict:
 @app.get("/api/health", tags=["System"])
 async def health_check() -> dict[str, Any]:
     """Liveness probe — returns 200 OK and model status."""
+    from src.circuit_breaker import get_all_breakers_status
     from src.local_model import get_local_model_status
     return {
         "status": "ok",
         "version": "2.0.0",
         "local_model": get_local_model_status(),
         "remote_api": "ready" if client is not None else "offline",
+        "circuit_breakers": get_all_breakers_status(),
     }
 

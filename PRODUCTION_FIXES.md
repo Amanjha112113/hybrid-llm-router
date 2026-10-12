@@ -49,3 +49,13 @@
 - Cost estimation now based on real token counts
 - 10-15% more accurate than character approximation
 
+
+### 9. Circuit Breaker for API Resilience ✅
+- File: src/circuit_breaker.py (new)
+- Protects against cascading failures when Fireworks API degrades
+- States: CLOSED (normal) → OPEN (fail-fast) → HALF_OPEN (testing)
+- Opens after 5 failures, retests after 30s cooldown
+- Integrated into src/fireworks_client.py
+- Status exposed via /api/health endpoint
+- Prevents timeout cascades and improves user experience
+
