@@ -46,8 +46,10 @@ from pydantic import BaseModel, Field
 from src.escalation_controller import process_task, TaskResult
 from src.fireworks_client import FireworksClient
 from src.tier_policy import TierPolicy
+from src.auth_middleware import AuthRateLimitMiddleware
 from src.category_classifier import classify_prompt
 from src.task_loader import Task
+from src.route_engine import RouteDecisionEngine, get_route_engine
 
 # ── DB / Telemetry imports (Phase 1) ──────────────────────────────────────────
 from db.engine import init_db, close_db, get_db_session
@@ -119,6 +121,18 @@ async def lifespan(app: FastAPI):
         # Don't crash — let the server start; /api/route will return 503
         # for remote-bound requests while local routing still works.
 
+    # ── Unified Route Engine (Phase 2: single routing source of truth) ────────
+    try:
+        engine = get_route_engine(
+            tier_policy=tier_policy,
+            allowed_models=allowed_models,
+        )
+        logger.info("RouteDecisionEngine initialized")
+    except Exception as exc:
+        logger.error("Failed to initialise RouteDecisionEngine: %s", exc)
+        # Non-fatal — endpoints will fall back to inline routing
+        # for remote-bound requests while local routing still works.
+
     logger.info("Gateway startup complete.")
     yield
 
@@ -146,6 +160,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Authentication & Rate Limiting (P0 Security) ──────────────────────────────
+# Add authentication middleware to protect endpoints from unauthorized access
+# Configure with VALID_API_KEYS and RATE_LIMIT_PER_MINUTE environment variables
+# Set ALLOW_ANONYMOUS=false to require authentication
+app.add_middleware(AuthRateLimitMiddleware)
+
+
 
 # ── In-memory fallback stats (preserved for /api/stats backward compat) ───────
 _mem_stats: dict[str, Any] = {
@@ -221,11 +243,15 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
     global client, tier_policy, allowed_models
     start_time = time.monotonic()
 
-    category = classify_prompt(req.prompt)
+    # ── Unified routing decision ──────────────────────────────────────────────
+    engine = get_route_engine(tier_policy=tier_policy, allowed_models=allowed_models)
+    route = engine.decide(prompt=req.prompt, preference="auto")
+    category = route.category
+
     task_id = f"web_{int(time.time() * 1000)}"
     task = Task(task_id=task_id, prompt=req.prompt)
 
-    # Optimistic backend label (may be corrected after process_task returns)
+    # Backend label from unified engine (may be corrected after process_task returns)
     local_capable = {"sentiment_classification", "named_entity_recognition", "text_summarisation"}
     backend = "local" if category in local_capable else "fireworks"
 

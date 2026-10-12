@@ -225,14 +225,11 @@ async def stream_chat_hybrid(
     enable_quality_check: bool = True,  # DEPRECATED - keeping for backward compat
 ) -> AsyncIterator[dict]:
     """
-    Hybrid streaming router with RouteLLM intelligent routing.
+    Hybrid streaming router — now delegates to the unified RouteDecisionEngine.
     
-    KEY CHANGE: Routes BEFORE generation (no wasted tokens)
-    
-    Priority: Accuracy > Cost Savings
-    - Predicts optimal model using RouteLLM
-    - Routes to predicted model ONCE (no retry waste)
-    - 85% token reduction vs 40% with quality validator
+    KEY CHANGE (v2): Uses src.route_engine.RouteDecisionEngine for routing
+    decisions instead of inline routing logic.  This ensures /api/chat/stream
+    and /api/route make identical decisions for the same prompt.
     
     Yields dictionaries with token data and metadata:
     {
@@ -253,86 +250,48 @@ async def stream_chat_hybrid(
     Yields:
         Event dictionaries
     """
-    from src.router import get_router
+    from src.route_engine import get_route_engine
     
     start_time = time.monotonic()
-    
-    # ── ROUTELLM INTELLIGENT ROUTING ──────────────────────────────────────────
-    # KEY INNOVATION: Predict optimal model BEFORE generation (no wasted tokens)
     
     # Get user's prompt (last message)
     user_prompt = messages[-1]["content"] if messages else ""
     context_length = len(messages) - 1  # Number of previous messages
     
-    # Get router and predict optimal backend
-    try:
-        router = get_router()
-        route_decision = router.predict_route(user_prompt, context_length)
-        
-        # Yield router decision to frontend
-        yield {
-            "type": "router",
-            "content": {
-                "backend": route_decision.backend,
-                "score": route_decision.score,
-                "confidence": route_decision.confidence,
-                "reason": route_decision.reason,
-                "complexity": route_decision.complexity,
-            }
+    # ── UNIFIED ROUTING via RouteDecisionEngine ───────────────────────────────
+    engine = get_route_engine(allowed_models=allowed_models)
+    decision = engine.decide(
+        prompt=user_prompt,
+        preference=preference,
+        context_length=context_length,
+    )
+    
+    # Yield router decision to frontend
+    yield {
+        "type": "router",
+        "content": {
+            "backend": decision.backend,
+            "score": decision.router_score,
+            "confidence": decision.router_confidence,
+            "reason": decision.router_reason,
+            "complexity": decision.complexity,
+            "category": decision.category,
+            "chosen_model": decision.chosen_model,
+            "router_available": decision.router_available,
+            "preference_overrode_router": decision.preference_overrode_router,
+            "decision_latency_ms": decision.decision_latency_ms,
         }
-        
-
-        logger.info(
-            f"Router decision: {route_decision.backend} "
-            f"(score={route_decision.score:.3f}, confidence={route_decision.confidence:.2f})"
-        )
-        
-        # ── ENHANCED DEBUGGING: Log routing decision details ──────────────────
-        logger.debug(
-            f"Router details - User prompt: '{user_prompt[:100]}...' "
-            f"| Backend: {route_decision.backend} "
-            f"| Score: {route_decision.score:.4f} "
-            f"| Confidence: {route_decision.confidence:.1f}% "
-            f"| Complexity: {route_decision.complexity} "
-            f"| Preference: {preference}"
-        )
-        
-        # Override with user preference if specified
-        if preference == "local":
-            route_decision.backend = "local"
-            logger.info("User preference override: forcing local")
-        elif preference in ("remote-efficient", "remote-power"):
-            route_decision.backend = "fireworks"
-            logger.info("User preference override: forcing cloud")
-        
-    except Exception as e:
-        logger.warning(f"Router prediction failed: {e}, using fallback logic")
-        # Fallback to simple heuristic
-        route_decision = None
-        should_use_local = (
-            preference == "local"
-            or (preference == "auto" and complexity in ("low", "standard"))
-        )
+    }
     
-    # Determine routing (router or fallback)
-    if route_decision:
-        should_use_local = (route_decision.backend == "local")
-    else:
-        should_use_local = (
-            preference == "local"
-            or (preference == "auto" and complexity in ("low", "standard"))
-        )
+    should_use_local = (decision.backend == "local")
     
-    # ── Path 1: Local (Ollama) - Enhanced with validation and debugging ────────
+    # ── Path 1: Local (Ollama) ────────────────────────────────────────────────
     if should_use_local and USE_OLLAMA:
-        # ── VALIDATION: Check if router decision is being honored ──────────────
-        if route_decision and route_decision.backend != "local":
-            logger.warning(
-                f"ROUTING INCONSISTENCY: should_use_local=True but route_decision.backend='{route_decision.backend}'. "
-                f"This may indicate a logic error in routing decision."
-            )
-        
-        logger.info(f"Attempting local routing to {OLLAMA_MODEL} (router_routed={route_decision is not None})")
+        logger.info(
+            "Streaming via local %s (category=%s, complexity=%s, router=%s)",
+            OLLAMA_MODEL, decision.category, decision.complexity,
+            "ML" if decision.router_available else "heuristic",
+        )
         
         try:
             yield {
@@ -341,8 +300,9 @@ async def stream_chat_hybrid(
                     "backend": "local",
                     "model": OLLAMA_MODEL,
                     "status": "starting",
-                    "router_routed": route_decision is not None,
+                    "router_routed": decision.router_available,
                     "router_decision_honored": True,
+                    "category": decision.category,
                 }
             }
             
@@ -356,9 +316,15 @@ async def stream_chat_hybrid(
                     "model": OLLAMA_MODEL,
                 }
             
-            # Router predicted local would succeed - trust it and return
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
             est_tokens_saved = max(1, int(len(full_response) / 4))
+            
+            # Record success feedback for online learning
+            engine.record_outcome(
+                prompt=user_prompt,
+                routed_to="local",
+                outcome="success",
+            )
             
             yield {
                 "type": "done",
@@ -371,9 +337,9 @@ async def stream_chat_hybrid(
                     "savings_usd": round(est_tokens_saved * 0.0002 / 1000, 8),
                     "latency_ms": elapsed_ms,
                     "full_response": full_response,
-                    "router_score": route_decision.score if route_decision else None,
-                    "router_confidence": route_decision.confidence if route_decision else None,
-                    "router_reason": route_decision.reason if route_decision else None,
+                    "router_score": decision.router_score,
+                    "router_confidence": decision.router_confidence,
+                    "router_reason": decision.router_reason,
                 }
             }
             return
@@ -381,7 +347,13 @@ async def stream_chat_hybrid(
         except Exception as e:
             logger.warning(f"Local streaming failed: {e}, escalating to Fireworks")
             
-            # ── ENHANCED ERROR REPORTING: Provide user-friendly feedback ───────
+            # Record escalation feedback for online learning
+            engine.record_outcome(
+                prompt=user_prompt,
+                routed_to="local",
+                outcome="fail_escalated",
+            )
+            
             if "connection" in str(e).lower() or "refused" in str(e).lower():
                 error_reason = f"Ollama server not running on {OLLAMA_BASE_URL}. Start with 'ollama serve'"
                 escalation_reason = "ollama_unavailable"
@@ -397,54 +369,28 @@ async def stream_chat_hybrid(
                     "reason": error_reason,
                     "escalating": True,
                     "escalation_reason": escalation_reason,
-                    "router_decision_overridden": route_decision.backend == "local" if route_decision else False,
+                    "router_decision_overridden": decision.backend == "local",
                 }
             }
-            
-            # ── VALIDATION: Log when router decision is overridden by failure ──
-            if route_decision and route_decision.backend == "local":
-                logger.warning(
-                    f"ROUTER DECISION OVERRIDDEN: Router predicted local routing but local failed, "
-                    f"escalating to cloud. This may appear as a routing inversion to users."
-                )
     
-    # ── Path 2: Remote (Fireworks) - Enhanced with validation ─────────────────
-    
-    # ── VALIDATION: Check if we're routing to cloud as intended ────────────────
-    if route_decision and route_decision.backend == "local" and not should_use_local:
-        logger.warning(
-            f"ROUTING INCONSISTENCY: Router predicted local but should_use_local=False. "
-            f"Preference={preference}, USE_OLLAMA={USE_OLLAMA}"
-        )
-    elif route_decision and route_decision.backend == "fireworks":
-        logger.info(f"Routing to cloud as predicted by router (score={route_decision.score:.3f})")
-    else:
-        logger.info(f"Routing to cloud due to fallback logic (router_available={route_decision is not None})")
+    # ── Path 2: Remote (Fireworks) ────────────────────────────────────────────
+    logger.info(
+        "Streaming via Fireworks %s (category=%s, complexity=%s)",
+        decision.chosen_model, decision.category, decision.complexity,
+    )
     
     if fireworks_client is None or not allowed_models:
         yield {
             "type": "error", 
             "content": {
                 "message": "Remote inference unavailable - no Fireworks client configured",
-                "router_decision_failed": route_decision.backend if route_decision else None,
+                "router_decision_failed": decision.backend,
             }
         }
         return
     
-    # Choose model based on router decision or preference
-    if route_decision and route_decision.complexity == "high":
-        # High complexity - use powerful model
-        chosen_model = allowed_models[1] if len(allowed_models) > 1 else allowed_models[0]
-    elif preference == "remote-power":
-        chosen_model = allowed_models[-1] if allowed_models else allowed_models[0]
-    elif route_decision and route_decision.complexity == "low":
-        # Low complexity - use efficient model
-        chosen_model = allowed_models[0]
-    else:
-        # Standard complexity
-        chosen_model = allowed_models[0]
-    
-    max_tokens = 1500 if (route_decision and route_decision.complexity == "high") else 800
+    chosen_model = decision.chosen_model
+    max_tokens = decision.max_tokens
     
     try:
         yield {
@@ -453,7 +399,8 @@ async def stream_chat_hybrid(
                 "backend": "fireworks",
                 "model": chosen_model,
                 "status": "starting",
-                "router_routed": route_decision is not None,
+                "router_routed": decision.router_available,
+                "category": decision.category,
             }
         }
         
@@ -468,7 +415,7 @@ async def stream_chat_hybrid(
             api_key=api_key,
             base_url=base_url,
             max_tokens=max_tokens,
-            temperature=0.3,
+            temperature=decision.temperature,
         ):
             full_response += token
             yield {
@@ -486,6 +433,13 @@ async def stream_chat_hybrid(
         cost_per_token = 0.0002 / 1000  # $0.0002 per 1K tokens
         cost_usd = round(total_tokens * cost_per_token, 8)
         
+        # Record cloud success (no routing feedback — see record_outcome docs)
+        engine.record_outcome(
+            prompt=user_prompt,
+            routed_to="fireworks",
+            outcome="cloud_success",
+        )
+        
         yield {
             "type": "done",
             "content": {
@@ -497,9 +451,9 @@ async def stream_chat_hybrid(
                 "savings_usd": 0.0,
                 "latency_ms": elapsed_ms,
                 "full_response": full_response,
-                "router_score": route_decision.score if route_decision else None,
-                "router_confidence": route_decision.confidence if route_decision else None,
-                "router_reason": route_decision.reason if route_decision else None,
+                "router_score": decision.router_score,
+                "router_confidence": decision.router_confidence,
+                "router_reason": decision.router_reason,
             }
         }
         

@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import pickle
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -23,6 +23,48 @@ from typing import Literal, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# ── Pre-compiled educational intent patterns ──────────────────────────────────
+# Compiled once at module load instead of per-call for performance.
+
+_EDUCATIONAL_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        # Direct definitional
+        r'what is (a |an |the )?\w+',
+        r'define \w+',
+        r'meaning of \w+',
+        # Basic explanatory
+        r'explain (the )?(basics? of|what|how|\w+ in python)',
+        r'explain \w+ in \w+',
+        r'how does? \w+ work',
+        r'(basics?|fundamentals?) of \w+',
+        # Tutorial-style
+        r'(tutorial|guide) (for|on|about) \w+',
+        r'introduction to \w+',
+        r'getting started with \w+',
+        # Simple conceptual
+        r'difference between \w+ and \w+',
+        r'(advantages?|benefits?) of \w+',
+        r'types? of \w+',
+        # Programming concepts
+        r'what (is|are) \w+ in (python|javascript|programming)',
+        r'explain \w+ (concept|syntax|feature)',
+    ]
+]
+
+_SIMPLE_EDUCATIONAL_KEYWORDS = [
+    "what is", "define", "meaning of", "stands for",
+    "explain", "tutorial", "basics", "introduction",
+    "fundamentals", "overview", "concept of",
+]
+
+_COMPLEX_ANALYSIS_KEYWORDS = [
+    "analyze", "evaluate", "assess", "critique",
+    "comprehensive analysis", "detailed comparison",
+    "implications", "impact", "consequences",
+    "philosophical", "theoretical", "in-depth",
+]
 
 
 @dataclass
@@ -92,13 +134,24 @@ class RouteLLMRouter:
         self.local_routed = 0
         self.cloud_routed = 0
         
+        # Online learning feedback buffer
+        self._feedback_buffer: list[dict] = []
+        
         # Lazy-load sentence transformer (heavy import)
         self._encoder = None
         
-        # Load model if path provided
-        if model_path and Path(model_path).exists():
-            self.load(model_path)
-            logger.info(f"Router loaded from {model_path}")
+        # Load model if path provided — try safe format first, then legacy pkl
+        if model_path:
+            base = Path(model_path).with_suffix('')
+            has_safe = (Path(str(base) + '.npz').exists() 
+                       and Path(str(base) + '.json').exists())
+            has_legacy = Path(model_path).exists()
+            
+            if has_safe or has_legacy:
+                self.load(model_path)
+                logger.info(f"Router loaded from {model_path}")
+            else:
+                logger.info("Router initialized without pre-trained model")
         else:
             logger.info("Router initialized without pre-trained model")
     
@@ -270,17 +323,15 @@ class RouteLLMRouter:
         """
         Convert routing score to confidence level.
         
-        High magnitude score = high confidence
-        Low magnitude score = uncertain, close to threshold
+        Confidence measures distance from the **decision boundary** (threshold),
+        not distance from zero.  A score right at the threshold → 0.5 (uncertain);
+        farther away → approaches 1.0.
         """
-        # Use sigmoid-like function to map score magnitude to confidence
-        magnitude = abs(score)
+        # Distance from the decision boundary
+        distance_from_threshold = abs(score - self.threshold)
         
-        # Confidence increases with distance from threshold
-        # 0.0 score = 0.5 confidence (uncertain)
-        # ±2.0 score = 0.88 confidence (high)
-        # ±5.0 score = 0.99 confidence (very high)
-        confidence = 1 / (1 + np.exp(-magnitude))
+        # Sigmoid mapping: distance 0 → 0.5, distance 2 → 0.88, distance 5 → 0.99
+        confidence = 1 / (1 + np.exp(-2 * distance_from_threshold))
         
         return float(confidence)
     
@@ -293,75 +344,31 @@ class RouteLLMRouter:
         involve explaining concepts, definitions, and basic tutorials rather than
         complex analysis or creative generation.
         
+        Uses module-level pre-compiled patterns for performance.
+        
         Returns:
             dict with 'is_educational', 'confidence', and 'indicators'
         """
         prompt_lower = prompt.lower().strip()
         
-        # Educational intent patterns
-        educational_patterns = [
-            # Direct definitional
-            r'what is (a |an |the )?\w+',
-            r'define \w+',
-            r'meaning of \w+',
-            
-            # Basic explanatory (ENHANCED)
-            r'explain (the )?(basics? of|what|how|\w+ in python)',
-            r'explain \w+ in \w+',  # "explain tuples in python"
-            r'how does? \w+ work',
-            r'(basics?|fundamentals?) of \w+',
-            
-            # Tutorial-style
-            r'(tutorial|guide) (for|on|about) \w+',
-            r'introduction to \w+',
-            r'getting started with \w+',
-            
-            # Simple conceptual
-            r'difference between \w+ and \w+',
-            r'(advantages?|benefits?) of \w+',
-            r'types? of \w+',
-            
-            # Programming concepts
-            r'what (is|are) \w+ in (python|javascript|programming)',
-            r'explain \w+ (concept|syntax|feature)',
-        ]
-        
-        # Simple educational keywords (high confidence)
-        simple_educational = [
-            "what is", "define", "meaning of", "stands for",
-            "explain", "tutorial", "basics", "introduction",
-            "fundamentals", "overview", "concept of"
-        ]
-        
-        # Anti-patterns (complex analysis despite educational words)
-        complex_analysis_patterns = [
-            "analyze", "evaluate", "assess", "critique", 
-            "comprehensive analysis", "detailed comparison",
-            "implications", "impact", "consequences",
-            "philosophical", "theoretical", "in-depth"
-        ]
-        
-        import re
-        
-        # Check for educational patterns
+        # Check for educational patterns (pre-compiled at module level)
         educational_score = 0
         indicators = []
         
-        # Pattern matching
-        for pattern in educational_patterns:
-            if re.search(pattern, prompt_lower):
+        for pattern in _EDUCATIONAL_PATTERNS:
+            if pattern.search(prompt_lower):
                 educational_score += 2
-                indicators.append(f"pattern: {pattern}")
+                indicators.append(f"pattern: {pattern.pattern}")
         
         # Simple keyword matching
-        for keyword in simple_educational:
+        for keyword in _SIMPLE_EDUCATIONAL_KEYWORDS:
             if keyword in prompt_lower:
                 educational_score += 1
                 indicators.append(f"keyword: {keyword}")
         
         # Check for complexity anti-patterns
         complexity_penalty = 0
-        for anti_pattern in complex_analysis_patterns:
+        for anti_pattern in _COMPLEX_ANALYSIS_KEYWORDS:
             if anti_pattern in prompt_lower:
                 complexity_penalty += 1
                 indicators.append(f"complexity: {anti_pattern}")
@@ -530,8 +537,11 @@ class RouteLLMRouter:
             score += 0.2
         
         # Make decision
-        backend: Literal["local", "fireworks"] = "local" if score < 0 else "fireworks"
-        confidence = min(0.6, abs(score) / 2.0)  # Heuristic confidence capped at 0.6
+        # Use self.threshold for consistency with the trained model path
+        backend: Literal["local", "fireworks"] = "local" if score < self.threshold else "fireworks"
+        # Heuristic confidence capped at 0.6 since we're less certain without ML
+        distance_from_threshold = abs(score - self.threshold)
+        confidence = min(0.6, distance_from_threshold / 2.0)
         complexity = self._estimate_complexity(prompt, context_length, score)
         reason = f"Heuristic routing (model not trained): {backend} for {complexity} query"
         
@@ -622,41 +632,95 @@ class RouteLLMRouter:
         logger.info(f"Router training complete. Final loss: {loss:.4f}")
     
     def save(self, path: str):
-        """Save trained router to disk."""
-        state = {
-            "threshold": self.threshold,
-            "embedding_model_name": self.embedding_model_name,
-            "is_trained": self.is_trained,
-            "preference_matrix": self.preference_matrix,
-            "prompt_embeddings": self.prompt_embeddings,
-            "training_labels": self.training_labels,
-            "predictions_made": self.predictions_made,
-            "local_routed": self.local_routed,
-            "cloud_routed": self.cloud_routed,
+        """Save trained router to disk using safe serialization (no pickle).
+        
+        Weights are stored in .npz (numpy) and metadata in .json.
+        This avoids the arbitrary code execution risk of pickle.
+        """
+        base = Path(path).with_suffix('')  # strip .pkl if present
+        base.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save numpy arrays to .npz (safe, portable)
+        arrays = {}
+        if self.preference_matrix is not None:
+            arrays['preference_matrix'] = self.preference_matrix
+        if self.prompt_embeddings is not None:
+            arrays['prompt_embeddings'] = self.prompt_embeddings
+        if self.training_labels is not None:
+            arrays['training_labels'] = self.training_labels
+        
+        if arrays:
+            np.savez(str(base) + '.npz', **arrays)
+        
+        # Save scalar metadata to JSON (human-readable, auditable)
+        metadata = {
+            'threshold': self.threshold,
+            'embedding_model_name': self.embedding_model_name,
+            'is_trained': self.is_trained,
+            'predictions_made': self.predictions_made,
+            'local_routed': self.local_routed,
+            'cloud_routed': self.cloud_routed,
         }
+        with open(str(base) + '.json', 'w') as f:
+            json.dump(metadata, f, indent=2)
         
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump(state, f)
-        
-        logger.info(f"Router saved to {path}")
+        logger.info(f"Router saved to {base}.{{npz,json}}")
     
     def load(self, path: str):
-        """Load trained router from disk."""
-        with open(path, "rb") as f:
-            state = pickle.load(f)
+        """Load trained router from disk.
         
-        self.threshold = state["threshold"]
-        self.embedding_model_name = state["embedding_model_name"]
-        self.is_trained = state["is_trained"]
-        self.preference_matrix = state["preference_matrix"]
-        self.prompt_embeddings = state["prompt_embeddings"]
-        self.training_labels = state["training_labels"]
-        self.predictions_made = state.get("predictions_made", 0)
-        self.local_routed = state.get("local_routed", 0)
-        self.cloud_routed = state.get("cloud_routed", 0)
+        Supports both new safe format (.npz + .json) and legacy pickle (.pkl)
+        for backward compatibility during migration.
+        """
+        base = Path(path).with_suffix('')
+        npz_path = Path(str(base) + '.npz')
+        json_path = Path(str(base) + '.json')
         
-        logger.info(f"Router loaded from {path}")
+        if npz_path.exists() and json_path.exists():
+            # ── New safe format ────────────────────────────────────────────
+            with open(json_path, 'r') as f:
+                metadata = json.load(f)
+            
+            self.threshold = metadata['threshold']
+            self.embedding_model_name = metadata['embedding_model_name']
+            self.is_trained = metadata['is_trained']
+            self.predictions_made = metadata.get('predictions_made', 0)
+            self.local_routed = metadata.get('local_routed', 0)
+            self.cloud_routed = metadata.get('cloud_routed', 0)
+            
+            data = np.load(str(npz_path))
+            self.preference_matrix = data.get('preference_matrix')
+            self.prompt_embeddings = data.get('prompt_embeddings')
+            self.training_labels = data.get('training_labels')
+            
+            logger.info(f"Router loaded from safe format: {base}.{{npz,json}}")
+        
+        elif Path(path).exists() and path.endswith('.pkl'):
+            # ── Legacy pickle (migrate on next save) ──────────────────────
+            import pickle
+            logger.warning(
+                "Loading router from LEGACY pickle format. "
+                "This is a security risk — will auto-migrate to safe format on next save()."
+            )
+            with open(path, 'rb') as f:
+                state = pickle.load(f)
+            
+            self.threshold = state['threshold']
+            self.embedding_model_name = state['embedding_model_name']
+            self.is_trained = state['is_trained']
+            self.preference_matrix = state['preference_matrix']
+            self.prompt_embeddings = state['prompt_embeddings']
+            self.training_labels = state['training_labels']
+            self.predictions_made = state.get('predictions_made', 0)
+            self.local_routed = state.get('local_routed', 0)
+            self.cloud_routed = state.get('cloud_routed', 0)
+            
+            # Auto-migrate: save in safe format immediately
+            self.save(path)
+            logger.info(f"Router migrated from pickle to safe format")
+        
+        else:
+            logger.warning(f"No router model found at {path} — starting untrained")
     
     def get_stats(self) -> dict:
         """Get router statistics."""
@@ -668,7 +732,76 @@ class RouteLLMRouter:
             "cloud_routed": self.cloud_routed,
             "local_ratio": self.local_routed / max(1, self.predictions_made),
             "training_examples": len(self.prompt_embeddings) if self.prompt_embeddings is not None else 0,
+            "pending_feedback": len(self._feedback_buffer),
         }
+    
+    # ── Online learning / feedback recording ──────────────────────────────────
+    
+    def record_feedback(
+        self,
+        prompt: str,
+        label: int,
+    ):
+        """
+        Record a routing outcome for future retraining.
+        
+        Args:
+            prompt: The user query that was routed
+            label: 0 = local succeeded, 1 = cloud was needed (local failed)
+        """
+        self._feedback_buffer.append({'prompt': prompt, 'label': label})
+        logger.debug(
+            f"Feedback recorded (label={label}). "
+            f"Buffer size: {len(self._feedback_buffer)}"
+        )
+    
+    def retrain_incremental(self, min_samples: int = 50):
+        """
+        Retrain the router using accumulated feedback + existing training data.
+        
+        Only retrains if enough new feedback has accumulated.
+        Returns True if retraining occurred.
+        """
+        if len(self._feedback_buffer) < min_samples:
+            logger.debug(
+                f"Not enough feedback for retraining "
+                f"({len(self._feedback_buffer)}/{min_samples})"
+            )
+            return False
+        
+        # Combine existing training data with new feedback
+        new_prompts = [f['prompt'] for f in self._feedback_buffer]
+        new_labels = [f['label'] for f in self._feedback_buffer]
+        
+        if self.prompt_embeddings is not None and self.training_labels is not None:
+            # Embed new prompts
+            try:
+                new_embeddings = [self.embed_prompt(p) for p in new_prompts]
+            except Exception as e:
+                logger.error(f"Failed to embed feedback prompts: {e}")
+                return False
+            
+            # Append to existing training data
+            all_embeddings = np.vstack([
+                self.prompt_embeddings,
+                np.array(new_embeddings)
+            ])
+            all_labels = np.concatenate([
+                self.training_labels,
+                np.array(new_labels)
+            ])
+            
+            # Retrain on combined dataset
+            all_prompts = [''] * len(self.prompt_embeddings) + new_prompts
+            self.train(all_prompts, all_labels.tolist())
+        else:
+            # First training run
+            self.train(new_prompts, new_labels)
+        
+        # Clear feedback buffer after successful retraining
+        self._feedback_buffer.clear()
+        logger.info("Router retrained with incremental feedback")
+        return True
 
 
 # ── Global router instance ────────────────────────────────────────────────────
