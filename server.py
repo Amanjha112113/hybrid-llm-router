@@ -39,9 +39,13 @@ except ImportError:
     pass
 
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+import threading
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+from src.request_id_middleware import RequestIDMiddleware
 
 from src.escalation_controller import process_task, TaskResult
 from src.fireworks_client import FireworksClient
@@ -129,9 +133,14 @@ async def lifespan(app: FastAPI):
         )
         logger.info("RouteDecisionEngine initialized")
     except Exception as exc:
+        engine = None
         logger.error("Failed to initialise RouteDecisionEngine: %s", exc)
-        # Non-fatal — endpoints will fall back to inline routing
-        # for remote-bound requests while local routing still works.
+
+    # Attach shared resources to app.state for clean dependency access
+    app.state.client = client
+    app.state.tier_policy = tier_policy
+    app.state.allowed_models = allowed_models
+    app.state.route_engine = engine
 
     logger.info("Gateway startup complete.")
     yield
@@ -153,23 +162,44 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ── Middleware Order: RequestID -> CORS -> Auth & Rate Limiting ──────────────
+app.add_middleware(RequestIDMiddleware)
 
-# ── Authentication & Rate Limiting (P0 Security) ──────────────────────────────
-# Add authentication middleware to protect endpoints from unauthorized access
-# Configure with VALID_API_KEYS and RATE_LIMIT_PER_MINUTE environment variables
-# Set ALLOW_ANONYMOUS=false to require authentication
+cors_origins_env = os.environ.get("CORS_ORIGINS", "")
+if cors_origins_env.strip():
+    allowed_cors_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+else:
+    allowed_cors_origins = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8000",
+    ]
+
+if "*" in allowed_cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 app.add_middleware(AuthRateLimitMiddleware)
 
 
-
-# ── In-memory fallback stats (preserved for /api/stats backward compat) ───────
+# ── In-memory fallback stats & concurrency lock ──────────────────────────────
+_mem_stats_lock = threading.Lock()
 _mem_stats: dict[str, Any] = {
     "total_requests": 0,
     "local_count": 0,
@@ -178,6 +208,51 @@ _mem_stats: dict[str, Any] = {
     "tokens_used": 0,
     "history": [],
 }
+
+
+def _record_mem_stat(
+    prompt: str,
+    category: str,
+    backend: str,
+    elapsed: float,
+    tokens_saved: int = 0,
+    tokens_used: int = 0,
+    succeeded_validation: bool = True,
+):
+    """Thread-safe update of legacy in-memory stats."""
+    with _mem_stats_lock:
+        _mem_stats["total_requests"] += 1
+        if backend == "local":
+            _mem_stats["local_count"] += 1
+            _mem_stats["tokens_saved"] += tokens_saved
+        else:
+            _mem_stats["remote_count"] += 1
+            _mem_stats["tokens_used"] += tokens_used
+
+        log_item = {
+            "timestamp": time.time(),
+            "prompt": prompt[:80],
+            "category": category,
+            "backend": backend,
+            "tokens_used": tokens_used,
+            "succeeded_validation": succeeded_validation,
+            "elapsed_seconds": round(elapsed, 3),
+        }
+        _mem_stats["history"].insert(0, log_item)
+        if len(_mem_stats["history"]) > 20:
+            _mem_stats["history"].pop()
+
+
+def _get_request_user_id(request: Request) -> str:
+    """Extract authenticated user identifier or client user header for multi-tenancy."""
+    user_header = request.headers.get("X-User-ID")
+    if user_header and user_header.strip():
+        return user_header.strip()
+    api_key = getattr(request.state, "api_key", None)
+    if api_key and api_key != "anonymous":
+        import hashlib
+        return f"user_{hashlib.sha256(api_key.encode()).hexdigest()[:12]}"
+    return "anonymous"
 
 
 # ── Pydantic V2 schemas ───────────────────────────────────────────────────────
@@ -231,29 +306,27 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
     Route an incoming prompt through the hybrid inference pipeline.
 
     Flow:
-      1. Classify prompt category
-      2. Attempt local inference (Qwen)
-      3. Escalate to Fireworks API if local fails or lacks confidence
-      4. Schedule a background DB write (telemetry) — zero latency impact
-      5. Return the response immediately
-
-    The ``BackgroundTasks`` dependency is injected by FastAPI; the telemetry
-    write runs *after* the HTTP response has been sent to the client.
+      1. Unified RouteDecisionEngine decides backend + model
+      2. If local: attempt local inference via Ollama/GGUF
+      3. If local fails or backend=fireworks: escalate to Fireworks API
+      4. Record routing outcome for online learning feedback loop
+      5. Schedule background DB write (telemetry) — zero latency impact
+      6. Return the response immediately
     """
     global client, tier_policy, allowed_models
+    from src.token_utils import count_tokens
     start_time = time.monotonic()
 
-    # ── Unified routing decision ──────────────────────────────────────────────
+    # ── Unified routing decision (single source of truth) ─────────────────────
     engine = get_route_engine(tier_policy=tier_policy, allowed_models=allowed_models)
     route = engine.decide(prompt=req.prompt, preference="auto")
     category = route.category
+    # Use the engine's decision — NOT a hardcoded set
+    backend = route.backend
+    chosen_model = route.chosen_model
 
     task_id = f"web_{int(time.time() * 1000)}"
     task = Task(task_id=task_id, prompt=req.prompt)
-
-    # Backend label from unified engine (may be corrected after process_task returns)
-    local_capable = {"sentiment_classification", "named_entity_recognition", "text_summarisation"}
-    backend = "local" if category in local_capable else "fireworks"
 
     # Ensure client is initialized if possible
     if client is None or tier_policy is None:
@@ -273,8 +346,8 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
             except Exception as e:
                 logger.warning(f"Lazy FireworksClient init failed: {e}")
 
-    # If category is local-capable, we can attempt local inference even without remote client
-    if category in local_capable:
+    # ── Path 1: Router chose LOCAL ────────────────────────────────────────────
+    if backend == "local":
         from src.local_model import answer_local
         from src.answer_validator import validate_tier_a
         from src.fireworks_client import CompletionResult
@@ -286,18 +359,24 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
             if is_valid:
                 elapsed = time.monotonic() - start_time
                 elapsed_ms = int(elapsed * 1000)
-                backend = "local"
                 model_used = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b") if os.environ.get("USE_OLLAMA", "true").lower() in ("true", "1") else "local_model"
-                est_tokens_saved = int(len(req.prompt) / 4) + 150
+                est_tokens_saved = count_tokens(req.prompt) + count_tokens(local_ans)
                 from db.models import _compute_savings_usd
-                savings_usd = _compute_savings_usd(backend, est_tokens_saved)
+                savings_usd = _compute_savings_usd("local", est_tokens_saved)
+
+                # ── Feedback: local succeeded ──
+                engine.record_outcome(
+                    prompt=req.prompt,
+                    routed_to="local",
+                    outcome="success",
+                )
 
                 background_tasks.add_task(
                     log_request_to_db,
                     task_id=task_id,
                     prompt=req.prompt,
                     category=category,
-                    backend=backend,
+                    backend="local",
                     model_used=model_used,
                     tokens_used=0,
                     elapsed_ms=elapsed_ms,
@@ -306,24 +385,21 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
                     served_from_cache=False,
                 )
 
-
-                _mem_stats["total_requests"] += 1
-                _mem_stats["local_count"] += 1
-                _mem_stats["tokens_saved"] += est_tokens_saved
-                _mem_stats["history"].insert(0, {
-                    "prompt": req.prompt[:80],
-                    "category": category,
-                    "backend": backend,
-                    "elapsed_seconds": round(elapsed, 3),
-                })
-                if len(_mem_stats["history"]) > 20:
-                    _mem_stats["history"].pop()
+                _record_mem_stat(
+                    prompt=req.prompt,
+                    category=category,
+                    backend="local",
+                    elapsed=elapsed,
+                    tokens_saved=est_tokens_saved,
+                    tokens_used=0,
+                    succeeded_validation=True,
+                )
 
                 return RouteResponse(
                     task_id=task_id,
-                    prompt=req.prompt,
+                    answer=local_ans,
                     category=category,
-                    backend=backend,
+                    backend="local",
                     model_used=model_used,
                     tokens_used=0,
                     tokens_saved=est_tokens_saved,
@@ -332,17 +408,22 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
                     elapsed_seconds=round(elapsed, 4),
                     elapsed_ms=elapsed_ms,
                     succeeded_validation=True,
-                    answer=local_ans,
                 )
 
+        # Local attempt failed — escalate to cloud
+        logger.info("Local inference failed/empty for task %s, escalating to Fireworks", task_id)
+        engine.record_outcome(
+            prompt=req.prompt,
+            routed_to="local",
+            outcome="fail_escalated",
+        )
 
-    # For remote-bound or escalated requests, FireworksClient must be active
+    # ── Path 2: Router chose FIREWORKS (or local escalated) ───────────────────
     if client is None or tier_policy is None:
         raise HTTPException(
             status_code=503,
             detail="Remote inference unavailable — FIREWORKS_API_KEY / FIREWORKS_BASE_URL not set and query could not be resolved locally."
         )
-
 
     try:
         res: TaskResult = await process_task(
@@ -358,25 +439,30 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
     elapsed = time.monotonic() - start_time
     elapsed_ms = int(elapsed * 1000)
 
-    # Correct backend label from actual token usage
-    if res.tokens_used == 0 and res.attempts <= 1 and category in local_capable:
-        backend = "local"
+    # Determine actual backend from inference result
+    if res.tokens_used == 0 and res.attempts <= 1:
+        actual_backend = "local"
         model_used = "local_model"
     else:
-        backend = "fireworks"
-        # Infer which Fireworks model was used (first in the allowed list if single attempt,
-        # second if escalated)
+        actual_backend = "fireworks"
         model_used = (
             allowed_models[0]
             if res.attempts <= 1 and len(allowed_models) > 0
             else (allowed_models[1] if len(allowed_models) > 1 else allowed_models[0])
         )
 
-    # Compute derived economics for the response payload
+    # ── Feedback: cloud result ──
+    engine.record_outcome(
+        prompt=req.prompt,
+        routed_to=actual_backend,
+        outcome="cloud_success" if actual_backend == "fireworks" else "success",
+    )
+
+    # Compute derived economics using accurate token counting
     from db.models import _compute_cost_usd, _compute_savings_usd
     cost_usd = _compute_cost_usd(model_used, res.tokens_used)
-    est_tokens_saved = int(len(req.prompt) / 4) + 150 if backend == "local" else 0
-    savings_usd = _compute_savings_usd(backend, est_tokens_saved)
+    est_tokens_saved = count_tokens(req.prompt) + 150 if actual_backend == "local" else 0
+    savings_usd = _compute_savings_usd(actual_backend, est_tokens_saved)
 
     # ── Background telemetry write — fires after response is sent ────────────
     background_tasks.add_task(
@@ -384,42 +470,31 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
         task_id=task_id,
         prompt=req.prompt,
         category=category,
-        backend=backend,
+        backend=actual_backend,
         model_used=model_used,
         tokens_used=res.tokens_used,
         elapsed_ms=elapsed_ms,
         succeeded_validation=res.succeeded_validation,
         attempts=res.attempts,
-        served_from_cache=False,  # Phase 2 will set this
+        served_from_cache=False,
     )
 
-    # ── Update in-memory fallback stats ──────────────────────────────────────
-    _mem_stats["total_requests"] += 1
-    if backend == "local":
-        _mem_stats["local_count"] += 1
-        _mem_stats["tokens_saved"] += est_tokens_saved
-    else:
-        _mem_stats["remote_count"] += 1
-        _mem_stats["tokens_used"] += res.tokens_used
-
-    log_item = {
-        "timestamp": time.time(),
-        "prompt": req.prompt,
-        "category": category,
-        "backend": backend,
-        "tokens_used": res.tokens_used,
-        "succeeded_validation": res.succeeded_validation,
-        "elapsed_seconds": round(elapsed, 2),
-    }
-    _mem_stats["history"].insert(0, log_item)
-    if len(_mem_stats["history"]) > 20:
-        _mem_stats["history"].pop()
+    # ── Update in-memory fallback stats thread-safely ────────────────────────
+    _record_mem_stat(
+        prompt=req.prompt,
+        category=category,
+        backend=actual_backend,
+        elapsed=elapsed,
+        tokens_saved=est_tokens_saved,
+        tokens_used=res.tokens_used,
+        succeeded_validation=res.succeeded_validation,
+    )
 
     return RouteResponse(
         task_id=task_id,
         answer=res.answer,
         category=category,
-        backend=backend,
+        backend=actual_backend,
         model_used=model_used,
         tokens_used=res.tokens_used,
         succeeded_validation=res.succeeded_validation,
@@ -430,6 +505,7 @@ async def route_query(req: RouteRequest, background_tasks: BackgroundTasks) -> R
         savings_usd=savings_usd,
         tokens_saved=est_tokens_saved,
     )
+
 
 
 
@@ -821,16 +897,17 @@ class MessageResponse(BaseModel):
 
 
 @app.post("/api/conversations", response_model=ConversationResponse, tags=["Conversations"])
-async def create_new_conversation(req: CreateConversationRequest) -> ConversationResponse:
+async def create_new_conversation(req: CreateConversationRequest, request: Request) -> ConversationResponse:
     """
     Create a new conversation session.
     
     Returns the newly created conversation with unique ID.
     """
+    user_id = _get_request_user_id(request)
     async with get_db_session() as session:
         conv = await create_conversation(
             session=session,
-            user_id="anonymous",  # TODO: Replace with actual user_id from auth
+            user_id=user_id,
             title=req.title,
             model_preference=req.model_preference,
         )
@@ -851,6 +928,7 @@ async def create_new_conversation(req: CreateConversationRequest) -> Conversatio
 
 @app.get("/api/conversations", response_model=list[ConversationResponse], tags=["Conversations"])
 async def list_user_conversations(
+    request: Request,
     status: str = "active",
     limit: int = 100,
     offset: int = 0,
@@ -863,10 +941,11 @@ async def list_user_conversations(
     - limit: Max results (default 100)
     - offset: Pagination offset
     """
+    user_id = _get_request_user_id(request)
     async with get_db_session() as session:
         convs = await list_conversations(
             session=session,
-            user_id="anonymous",  # TODO: Replace with actual user_id from auth
+            user_id=user_id,
             status=status,
             limit=limit,
             offset=offset,
@@ -891,6 +970,7 @@ async def list_user_conversations(
 
 @app.get("/api/conversations/search", response_model=list[ConversationResponse], tags=["Conversations"])
 async def search_user_conversations(
+    request: Request,
     q: str,
     limit: int = 20,
 ) -> list[ConversationResponse]:
@@ -901,10 +981,11 @@ async def search_user_conversations(
     - q: Search query string
     - limit: Max results (default 20)
     """
+    user_id = _get_request_user_id(request)
     async with get_db_session() as session:
         convs = await search_conversations(
             session=session,
-            user_id="anonymous",  # TODO: Replace with actual user_id from auth
+            user_id=user_id,
             query=q,
             limit=limit,
         )
@@ -1052,7 +1133,7 @@ async def get_conversation_messages_endpoint(
 
 
 @app.get("/api/conversations/stats/summary", tags=["Conversations"])
-async def get_conversation_statistics() -> dict:
+async def get_conversation_statistics(request: Request) -> dict:
     """
     Get aggregate statistics for user's conversations.
     
@@ -1063,10 +1144,11 @@ async def get_conversation_statistics() -> dict:
     - total_cost_usd
     - avg_cost_per_conversation
     """
+    user_id = _get_request_user_id(request)
     async with get_db_session() as session:
         stats = await get_conversation_stats(
             session=session,
-            user_id="anonymous",  # TODO: Replace with actual user_id from auth
+            user_id=user_id,
         )
         return stats
 
@@ -1075,14 +1157,36 @@ async def get_conversation_statistics() -> dict:
 
 @app.get("/api/health", tags=["System"])
 async def health_check() -> dict[str, Any]:
-    """Liveness probe — returns 200 OK and model status."""
-    from src.circuit_breaker import get_all_breakers_status
-    from src.local_model import get_local_model_status
+    """Active readiness + liveness probe — checks database, local model, and remote circuit breaker."""
+    from src.circuit_breaker import get_all_breakers_status, get_circuit_breaker
+    from src.local_model import check_local_model_health
+    from sqlalchemy import text
+    
+    db_status = "ok"
+    try:
+        async with get_db_session() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as exc:
+        db_status = f"error: {str(exc)[:100]}"
+    
+    local_status = await check_local_model_health()
+    
+    cb = get_circuit_breaker("fireworks_api")
+    remote_status = "unconfigured"
+    if client is not None:
+        if cb and cb.state.value == "open":
+            remote_status = "circuit_breaker_open"
+        else:
+            remote_status = "ready"
+            
+    is_healthy = db_status == "ok" and (local_status.get("status") == "ready" or remote_status == "ready")
+
     return {
-        "status": "ok",
+        "status": "healthy" if is_healthy else "degraded",
         "version": "2.0.0",
-        "local_model": get_local_model_status(),
-        "remote_api": "ready" if client is not None else "offline",
+        "database": db_status,
+        "local_model": local_status,
+        "remote_api": remote_status,
         "circuit_breakers": get_all_breakers_status(),
     }
 

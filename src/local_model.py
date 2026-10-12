@@ -271,3 +271,24 @@ def get_local_model_status() -> dict:
     }
 
 
+async def check_local_model_health() -> dict:
+    """Active health check probe for the local inference backend."""
+    status_info = get_local_model_status()
+    ollama_reachable = False
+    
+    if USE_OLLAMA:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=1.5) as client:
+                res = await client.get(f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags")
+                ollama_reachable = res.status_code == 200
+        except Exception:
+            ollama_reachable = False
+
+    status_info["ollama_reachable"] = ollama_reachable
+    status_info["status"] = (
+        "ready" if (ollama_reachable or status_info["fallback_gguf_exists"]) else "unavailable"
+    )
+    return status_info
+
+

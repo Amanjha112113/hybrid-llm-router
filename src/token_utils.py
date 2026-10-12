@@ -113,6 +113,7 @@ def count_message_tokens(messages: list[dict[str, str]], model: str = "gpt-4") -
 def estimate_cost_usd(tokens: int, model: str, is_input: bool = True) -> float:
     """
     Estimate USD cost for token usage.
+    Delegates to unified src.pricing config.
     
     Args:
         tokens: Number of tokens
@@ -122,34 +123,5 @@ def estimate_cost_usd(tokens: int, model: str, is_input: bool = True) -> float:
     Returns:
         Estimated cost in USD
     """
-    # Pricing as of 2024 (per 1M tokens)
-    pricing = {
-        "gpt-4": {"input": 30.0, "output": 60.0},
-        "gpt-4-turbo": {"input": 10.0, "output": 30.0},
-        "gpt-3.5-turbo": {"input": 0.5, "output": 1.5},
-        "gpt-3.5-turbo-instruct": {"input": 1.5, "output": 2.0},
-        # Fireworks pricing (placeholder - update with actual rates)
-        "fireworks": {"input": 0.2, "output": 0.2},
-    }
-    
-    # Normalize model name
-    model_key = model.lower()
-    if "gpt-4-turbo" in model_key:
-        model_key = "gpt-4-turbo"
-    elif "gpt-4" in model_key:
-        model_key = "gpt-4"
-    elif "gpt-3.5" in model_key:
-        if "instruct" in model_key:
-            model_key = "gpt-3.5-turbo-instruct"
-        else:
-            model_key = "gpt-3.5-turbo"
-    elif "fireworks" in model_key or "llama" in model_key or "mistral" in model_key:
-        model_key = "fireworks"
-    else:
-        # Unknown model, use conservative GPT-4 pricing
-        model_key = "gpt-4"
-    
-    rate = pricing.get(model_key, pricing["gpt-4"])
-    cost_per_token = rate["input" if is_input else "output"] / 1_000_000
-    
-    return tokens * cost_per_token
+    from src.pricing import compute_cost_usd
+    return compute_cost_usd(model=model, tokens=tokens, is_input=is_input)

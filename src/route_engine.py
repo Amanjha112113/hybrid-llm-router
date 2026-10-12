@@ -359,4 +359,3 @@ def get_route_engine(
         )
         logger.info("RouteDecisionEngine initialized")
     return _engine
-""", "toolAction": "Creating route engine", "toolSummary": "Unified route engine"}

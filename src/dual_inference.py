@@ -11,6 +11,9 @@ import logging
 import time
 from typing import AsyncIterator, Dict, Any
 
+from src.token_utils import count_tokens
+from src.pricing import compute_cost_usd, compute_savings_usd
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,13 +107,13 @@ async def stream_dual_comparison(
             
             # Calculate local stats
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            tokens_saved = max(1, int(len(local_response) / 4))
+            tokens_saved = count_tokens(local_response)
             
             local_metadata = {
                 "backend": "local",
                 "tokens_saved": tokens_saved,
                 "cost_usd": 0.0,
-                "savings_usd": round(tokens_saved * 0.0002 / 1000, 8),
+                "savings_usd": compute_savings_usd("local", tokens_saved),
                 "latency_ms": elapsed_ms,
                 "full_response": local_response,
             }
@@ -135,8 +138,8 @@ async def stream_dual_comparison(
             
             # Calculate cloud stats
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            tokens_used = max(1, int(len(cloud_response) / 4))
-            cost_usd = round(tokens_used * 0.0002 / 1000, 8)
+            tokens_used = count_tokens(cloud_response)
+            cost_usd = compute_cost_usd(cloud_model, tokens_used, is_input=False)
             
             cloud_metadata = {
                 "backend": "cloud",
@@ -192,8 +195,8 @@ async def stream_dual_comparison(
     local_elapsed = int((time.monotonic() - start_time) * 1000)
     cloud_elapsed = int((time.monotonic() - start_time) * 1000)
     
-    local_tokens_saved = max(1, int(len(local_response) / 4))
-    cloud_tokens_used = max(1, int(len(cloud_response) / 4))
+    local_tokens_saved = count_tokens(local_response)
+    cloud_tokens_used = count_tokens(cloud_response)
     
     # Yield final comparison
     yield {
@@ -202,18 +205,18 @@ async def stream_dual_comparison(
             **local_metadata,
             "latency_ms": local_elapsed,
             "tokens_saved": local_tokens_saved,
-            "savings_usd": round(local_tokens_saved * 0.0002 / 1000, 8),
+            "savings_usd": compute_savings_usd("local", local_tokens_saved),
         },
         "cloud": {
             **cloud_metadata,
             "latency_ms": cloud_elapsed,
             "tokens_used": cloud_tokens_used,
-            "cost_usd": round(cloud_tokens_used * 0.0002 / 1000, 8),
+            "cost_usd": compute_cost_usd(cloud_model, cloud_tokens_used, is_input=False),
         },
         "comparison": {
             "local_length": len(local_response),
             "cloud_length": len(cloud_response),
             "latency_diff_ms": abs(local_elapsed - cloud_elapsed),
-            "cost_savings": round(cloud_tokens_used * 0.0002 / 1000, 8),
+            "cost_savings": compute_savings_usd("local", local_tokens_saved),
         },
     }

@@ -1,0 +1,42 @@
+# config/pricing.yaml
+# Single source of truth for model inference pricing
+# Rates are specified in USD per 1,000 tokens (per 1K)
+
+models:
+  # Local models — zero marginal cost
+  local_model:
+    input_cost_per_1k: 0.0
+    output_cost_per_1k: 0.0
+  qwen2.5:3b:
+    input_cost_per_1k: 0.0
+    output_cost_per_1k: 0.0
+  qwen2.5:0.5b:
+    input_cost_per_1k: 0.0
+    output_cost_per_1k: 0.0
+
+  # Fireworks AI models
+  accounts/fireworks/models/llama-v3p1-8b-instruct:
+    input_cost_per_1k: 0.0002
+    output_cost_per_1k: 0.0002
+  accounts/fireworks/models/deepseek-v4-pro:
+    input_cost_per_1k: 0.0009
+    output_cost_per_1k: 0.0009
+
+  # Reference frontier models (for comparison and multi-provider extension)
+  gpt-4:
+    input_cost_per_1k: 0.030
+    output_cost_per_1k: 0.060
+  gpt-4-turbo:
+    input_cost_per_1k: 0.010
+    output_cost_per_1k: 0.030
+  gpt-3.5-turbo:
+    input_cost_per_1k: 0.0005
+    output_cost_per_1k: 0.0015
+  gpt-3.5-turbo-instruct:
+    input_cost_per_1k: 0.0015
+    output_cost_per_1k: 0.0020
+
+defaults:
+  local_cost_per_1k: 0.0
+  # Default fallback rate for remote models when not explicitly listed
+  remote_cost_per_1k: 0.0002

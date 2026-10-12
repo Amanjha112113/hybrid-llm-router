@@ -29,34 +29,23 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from src.pricing import compute_cost_usd, compute_savings_usd, DEFAULT_REMOTE_COST_PER_1K
+
 # ── Cost constants (USD per 1 000 tokens) ─────────────────────────────────────
-# Source: Fireworks AI public pricing as of Oct 2024
-COST_LLAMA_8B_PER_1K = 0.0002   # accounts/fireworks/models/llama-v3p1-8b-instruct
-COST_DEEPSEEK_PER_1K = 0.0009   # accounts/fireworks/models/deepseek-v4-pro
-COST_LOCAL_PER_TOKEN = 0.0       # local Qwen model — zero marginal cost
+# Retained for backwards compatibility; calculations delegate to src.pricing
+COST_LLAMA_8B_PER_1K = DEFAULT_REMOTE_COST_PER_1K
+COST_DEEPSEEK_PER_1K = 0.0009
+COST_LOCAL_PER_TOKEN = 0.0
 
 
 def _compute_cost_usd(model: str, tokens: int) -> float:
-    """Return the USD cost for a given model + token count.
-
-    Keeps pricing logic in one place so updating rates is a one-line change.
-    """
-    rates = {
-        "local_model": COST_LOCAL_PER_TOKEN,
-        "accounts/fireworks/models/llama-v3p1-8b-instruct": COST_LLAMA_8B_PER_1K / 1000,
-        "accounts/fireworks/models/deepseek-v4-pro": COST_DEEPSEEK_PER_1K / 1000,
-    }
-    # Default to llama-8b rate for unknown models
-    rate = rates.get(model, COST_LLAMA_8B_PER_1K / 1000)
-    return round(rate * tokens, 8)
+    """Return the USD cost for a given model + token count using unified pricing config."""
+    return compute_cost_usd(model, tokens, is_input=False)
 
 
 def _compute_savings_usd(backend: str, tokens_saved: int) -> float:
-    """Compute what those tokens *would* have cost on the cheapest remote model."""
-    if backend != "local":
-        return 0.0
-    # Savings = what Llama-8B would have charged for the saved tokens
-    return round((COST_LLAMA_8B_PER_1K / 1000) * tokens_saved, 8)
+    """Compute what those tokens *would* have cost on the remote model using unified pricing config."""
+    return compute_savings_usd(backend, tokens_saved)
 
 
 # ── ORM Base ──────────────────────────────────────────────────────────────────
@@ -302,10 +291,10 @@ class RequestLog(Base):
         routing endpoint.  Computes derived fields (cost, savings, tokens_saved)
         automatically so the calling code stays clean.
         """
-        # Estimated tokens saved = rough prompt token count + avg output tokens
-        # This mirrors the original heuristic: chars/4 + 150 avg output tokens
+        # Estimated tokens saved = accurate prompt token count + avg output tokens
+        from src.token_utils import count_tokens
         est_tokens_saved = (
-            int(len(prompt) / 4) + 150 if backend == "local" else 0
+            count_tokens(prompt) + 150 if backend == "local" else 0
         )
 
         # Escalation path classification

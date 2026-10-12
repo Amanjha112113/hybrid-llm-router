@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections import defaultdict
 from typing import Optional
@@ -47,6 +48,7 @@ class RateLimiter:
     def __init__(self, requests_per_minute: int = 60):
         self.requests_per_minute = requests_per_minute
         self.requests: dict[str, list[float]] = defaultdict(list)
+        self._lock = threading.Lock()
     
     def check_rate_limit(self, key: str) -> tuple[bool, int]:
         """
@@ -58,21 +60,22 @@ class RateLimiter:
         now = time.time()
         window_start = now - 60  # 1 minute window
         
-        # Remove expired requests
-        self.requests[key] = [
-            ts for ts in self.requests[key]
-            if ts > window_start
-        ]
-        
-        # Check limit
-        current_count = len(self.requests[key])
-        allowed = current_count < self.requests_per_minute
-        
-        if allowed:
-            self.requests[key].append(now)
-        
-        remaining = max(0, self.requests_per_minute - current_count - 1)
-        return allowed, remaining
+        with self._lock:
+            # Remove expired requests
+            self.requests[key] = [
+                ts for ts in self.requests[key]
+                if ts > window_start
+            ]
+            
+            # Check limit
+            current_count = len(self.requests[key])
+            allowed = current_count < self.requests_per_minute
+            
+            if allowed:
+                self.requests[key].append(now)
+            
+            remaining = max(0, self.requests_per_minute - current_count - 1)
+            return allowed, remaining
 
 
 rate_limiter = RateLimiter(requests_per_minute=RATE_LIMIT_PER_MINUTE)

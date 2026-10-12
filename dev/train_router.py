@@ -220,9 +220,12 @@ async def main():
     # Extract real data
     prompts, labels = await extract_training_data()
     
-    # Add synthetic data if we don't have enough real data
-    if len(prompts) < 20:
-        logger.warning(f"Only {len(prompts)} real examples. Adding synthetic data...")
+    # Add synthetic data if we don't have enough balanced real data
+    if len(prompts) < 50 or labels.count(0) < 15 or labels.count(1) < 15:
+        logger.warning(
+            f"Data is sparse or imbalanced ({len(prompts)} examples: {labels.count(0)} local, {labels.count(1)} cloud). "
+            f"Supplementing with synthetic training examples..."
+        )
         prompts, labels = add_synthetic_data(prompts, labels)
     
     if len(prompts) < 5:
@@ -233,11 +236,11 @@ async def main():
     logger.info(f"  - Local: {labels.count(0)} ({labels.count(0)/len(labels)*100:.1f}%)")
     logger.info(f"  - Cloud: {labels.count(1)} ({labels.count(1)/len(labels)*100:.1f}%)")
     
-    # Train router
+    # Train router with calibrated threshold
     logger.info("\nInitializing router...")
     router = RouteLLMRouter(
         embedding_model="all-MiniLM-L6-v2",
-        threshold=0.0,
+        threshold=0.15,
         enable_fallback=True,
     )
     
