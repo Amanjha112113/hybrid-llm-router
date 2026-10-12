@@ -478,3 +478,5 @@ frontend/src/*.backup
 # ── Custom Exclusions ──────────────────────────────────────────────────────
 # Add your custom exclusions here
 
+*.backup
+*_backup*
