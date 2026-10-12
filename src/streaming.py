@@ -15,6 +15,7 @@ from typing import AsyncIterator, Optional
 
 import httpx
 
+from src.token_utils import count_tokens
 logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -317,7 +318,7 @@ async def stream_chat_hybrid(
                 }
             
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            est_tokens_saved = max(1, int(len(full_response) / 4))
+            est_tokens_saved = count_tokens(full_response)
             
             # Record success feedback for online learning
             engine.record_outcome(
@@ -427,7 +428,7 @@ async def stream_chat_hybrid(
         
         # Calculate costs
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
-        total_tokens = max(1, int(len(full_response) / 4))  # Rough estimate
+        total_tokens = count_tokens(full_response)
         
         # Cost calculation (simplified - use actual token counts in production)
         cost_per_token = 0.0002 / 1000  # $0.0002 per 1K tokens

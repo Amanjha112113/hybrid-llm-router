@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from src.local_model import chat_local
 from src.fireworks_client import FireworksClient, CompletionResult
+from src.token_utils import count_message_tokens, count_tokens
 from db.models import _compute_cost_usd, _compute_savings_usd
 
 logger = logging.getLogger(__name__)
@@ -35,12 +36,6 @@ class ChatTurnResult(BaseModel):
     latency_ms: int = 0
     route_reason: str = ""
     complexity: str = "standard"     # "low" | "standard" | "high"
-
-
-def _estimate_tokens(messages: list[dict[str, str]]) -> int:
-    """Rough estimation of token count across all messages (1 token ≈ 4 characters)."""
-    total_chars = sum(len(m.get("content", "")) for m in messages)
-    return max(1, int(total_chars / 4))
 
 
 def _assess_turn_complexity(last_msg: str, messages_count: int) -> tuple[str, str]:
@@ -90,7 +85,9 @@ async def route_chat_turn(
     """
     start_time = time.monotonic()
     last_msg = messages[-1].get("content", "") if messages else ""
-    history_tokens = _estimate_tokens(messages)
+    
+    # Use accurate token counting (tiktoken with fallback)
+    history_tokens = count_message_tokens(messages)
 
     complexity, reason = _assess_turn_complexity(last_msg, len(messages))
     local_model_name = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
@@ -113,7 +110,7 @@ async def route_chat_turn(
             local_ans = await chat_local(messages, max_tokens=700)
             if local_ans and len(local_ans.strip()) > 1:
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                output_tokens = max(1, int(len(local_ans) / 4))
+                output_tokens = count_tokens(local_ans)
                 tokens_saved = history_tokens + output_tokens
                 savings_usd = _compute_savings_usd("local", tokens_saved)
 

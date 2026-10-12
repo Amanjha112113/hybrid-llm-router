@@ -28,3 +28,4 @@ sentence-transformers>=2.2.0   # Lightweight embeddings (all-MiniLM-L6-v2, 23MB)
 scikit-learn>=1.3.0            # Utilities for ML operations
 numpy>=1.24.0                  # Numerical computing
 structlog>=24.1.0
+tiktoken>=0.7.0                 # Accurate token counting for OpenAI models
